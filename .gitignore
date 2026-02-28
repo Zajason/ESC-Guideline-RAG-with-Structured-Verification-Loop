@@ -1,0 +1,40 @@
+# -----------------------------
+# Ignore all folders by default
+# -----------------------------
+*/
+
+# -----------------------------
+# Keep root-level files
+# -----------------------------
+!*.py
+!*.ipynb
+!*.md
+!.gitignore
+
+# -----------------------------
+# Keep artifacts folder
+# -----------------------------
+!esc_rag_artifacts/
+!esc_rag_artifacts/**
+
+# -----------------------------
+# Explicitly ignore these folders
+# -----------------------------
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+esc_data/
+runs/
+
+# -----------------------------
+# Python cache
+# -----------------------------
+*.pyc
+*.pyo
+*.pyd
+
+# -----------------------------
+# OS files
+# -----------------------------
+.DS_Store
+Thumbs.db
