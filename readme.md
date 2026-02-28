@@ -312,9 +312,6 @@ This enables:
 
 This system is for research purposes only and is not intended for clinical decision-making.
 
-If needed, this README can be adapted into:
 
-- A shorter “GitHub landing page” version
-- A methods section draft for a journal submission
-- A diagram-ready architecture summary
-- A “Why this outperforms plain LLM” section for a paper
+
+
