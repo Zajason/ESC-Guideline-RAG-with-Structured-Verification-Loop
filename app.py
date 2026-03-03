@@ -1,5 +1,15 @@
 import os, json, time
+
+
+# Render Query A and Query B inputs vertically (one under the other)
+INPUT_LAYOUT_VERTICAL = True
 import streamlit as st
+# Keep A and B outputs separate and persistent across reruns.
+# Streamlit re-runs on every interaction; session_state prevents one run from overwriting the other.
+if "outA" not in st.session_state:
+    st.session_state.outA = {"resp": None, "debug": None, "report": None}
+if "outB" not in st.session_state:
+    st.session_state.outB = {"resp": None, "debug": None, "report": None}
 
 from rag_core import (
     pretty_query_A, pretty_query_B,
