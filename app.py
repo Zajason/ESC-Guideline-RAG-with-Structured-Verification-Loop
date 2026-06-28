@@ -25,7 +25,7 @@ st.title("ESC RAG Runner — Query A / Query B")
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    model_name = st.text_input("Model", value=os.environ.get("ESC_RAG_MODEL", "gpt-5.2"))
+    model_name = st.text_input("Model", value=os.environ.get("ESC_RAG_MODEL", "gpt-5.4-mini"))
 
     top_k_A = st.slider("Top-K chunks (A)", 8, 30, 16, 1)
     top_k_B = st.slider("Top-K chunks (B)", 8, 40, 18, 1)

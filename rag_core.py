@@ -15,7 +15,8 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-MODEL_NAME_DEFAULT = os.environ.get("ESC_RAG_MODEL", "gpt-5.2")
+MODEL_NAME_DEFAULT = os.environ.get("ESC_RAG_MODEL", "gpt-5.4-mini")
+USE_DYNAMIC_QUERYGEN = os.environ.get("ESC_RAG_DYNAMIC_QUERYGEN", "0").strip().lower() in {"1", "true", "yes"}
 EMBED_MODEL_NAME = os.environ.get("ESC_RAG_EMBED_MODEL", "intfloat/e5-large-v2")
 RERANK_MODEL_NAME = os.environ.get("ESC_RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
@@ -91,9 +92,6 @@ def call_gpt(
         except TypeError:
             # Older SDK: no response_format kwarg.
             pass
-        except Exception:
-            # Any other transient error: fall through to basic call.
-            pass
 
     # Basic call (works broadly)
     resp = client.responses.create(
@@ -108,15 +106,16 @@ def call_gpt(
 # SCALE TEXT (IN-PROMPT)
 # ============================================================
 
-PROGNOSIS_SCALE_TEXT_1_7 = """
-PROGNOSIS SCALE (1–7):
+PROGNOSIS_SCALE_TEXT_1_8 = """
+PROGNOSIS SCALE (1–8):
 1 = Safe for Discharge from ER — Fully stable; no further inpatient management needed.
 2 = Short Observation (<24h) — Brief monitoring/diagnostic workup; likely home next day.
 3 = Short Admission (1–3 days) — Needs treatment/monitoring; can be discharged within ~72h.
 4 = Standard Admission (3–7 days) — Requires therapy, imaging, gradual stabilization; moderate severity.
 5 = Prolonged Admission (>7 days) — Complex management; likely complications; slow response.
-6 = High Risk of ICU/Intubation — Hemodynamic or respiratory instability; ICU likely.
-7 = High Risk of Death (In-hospital) — Critical illness; multiorgan risk or very poor reserve.
+6 = High Risk of ICU — Hemodynamic or respiratory instability; ICU likely.
+7 = High Risk of Intubation — Impending or established respiratory failure; intubation likely.
+8 = High Risk of Death (In-hospital) — Critical illness; multiorgan risk or very poor reserve.
 """.strip()
 
 HDS_SCALE_TEXT_1_5 = """
@@ -134,6 +133,11 @@ STANDARDIZED HOSPITALIZATION DURATION SCALE (HDS-5):
 
 QUERYGEN_SYSTEM = """
 You generate short retrieval queries for ESC guideline passages.
+Prioritize queries that retrieve:
+- diagnostic algorithms
+- monitoring / disposition criteria
+- treatment recommendations
+- specific medication classes when relevant (e.g. diuretics, ACEi/ARNI, beta-blockers, MRA, SGLT2 inhibitors, antiplatelets, anticoagulants, vasodilators)
 Output only JSON: {"queries":[...]}.
 """.strip()
 
@@ -141,7 +145,7 @@ DRAFT_SYSTEM = """
 You are evaluating clinical reasoning for research only (NOT real patient care).
 
 CRITICAL CITATION RULES:
-- ESC guideline excerpts can support ONLY: definitions, recommended actions/tests, algorithms, risk stratification frameworks, monitoring recommendations.
+- ESC guideline excerpts can support ONLY: definitions, recommended actions/tests, algorithms, risk stratification frameworks, monitoring recommendations, and medication-class recommendations.
 - Do NOT cite ESC excerpts for patient-specific facts (labs/vitals/imaging/ECG/ABG interpretations, e.g., "cephalization", "respiratory alkalosis", "rising troponin").
 - If you mention patient-specific facts, keep them UNCITED in one_liner/justification/clinical_judgment.
 - Use citations [chunk_id] ONLY in:
@@ -154,6 +158,15 @@ FIELD RULES (TO REDUCE VERIFIER FAILS):
 - disposition.guideline_support: cite ONLY if the excerpt explicitly states admission/discharge/level-of-care criteria. Otherwise:
   "No direct guideline citation retrieved for this point."
 - tests[].reason: guideline-oriented; evidence allowed if excerpt directly supports the test/timing.
+
+TREATMENT-SPECIFIC RULES:
+- When giving treatment plans, DO NOT stop at vague phrases like "GDMT", "optimize therapy", or "ACS pathway" if the retrieved excerpts support named medication classes.
+- Prefer named medication classes without dosing, for example:
+  - HFrEF / AHF: intravenous loop diuretics, thiazide-type diuretic add-on, ACE inhibitor / ARB / ARNI, beta-blocker, mineralocorticoid receptor antagonist (MRA), SGLT2 inhibitor, oxygen, non-invasive ventilation, intravenous vasodilators when appropriate, thromboprophylaxis.
+  - ACS / NSTE-ACS: aspirin, P2Y12 inhibitor, parenteral anticoagulation, anti-ischemic therapy, invasive coronary evaluation when appropriate.
+  - PE: anticoagulation, reperfusion/escalation only if supported by the retrieved text.
+- Do NOT invent medications or classes not supported by the retrieved ESC excerpts.
+- Do NOT include dosing.
 
 STYLE:
 - Clinician-readable, short.
@@ -185,10 +198,10 @@ CONSISTENCY / FORMAT:
   - exactly 3 differential items; probabilities sum to 1.0 (±0.01)
   - prognosis: exactly 3 items; dx match differential dx in same order
   - tests <= 7
-  - prognosis score: 1–7
+  - prognosis score: 1–8
 - Query B:
   - cause_workup_algorithm length 6–10
-  - prognosis score: 1–7
+  - prognosis score: 1–8
   - HDS score: 1–5
 
 Output ONLY JSON:
@@ -347,7 +360,49 @@ def severity_assessment(snap: dict) -> dict:
             tier = "MED"
 
     return {"tier": tier}
+def augment_queries_for_treatment(case_text: str, question_set: str, queries: List[str]) -> List[str]:
+    """
+    Add medication-focused retrieval queries based on the case.
+    This is conservative: it only adds class-level treatment queries and never forces treatment.
+    """
+    snap = parse_case_snapshot(case_text)
+    extra: List[str] = []
 
+    if snap.get("hf_terms"):
+        extra += [
+            "acute heart failure intravenous loop diuretics guideline ESC",
+            "acute heart failure thiazide add on resistant oedema ESC",
+            "acute heart failure oxygen non invasive ventilation ESC",
+            "HFrEF ACE inhibitor ARNI beta blocker MRA SGLT2 ESC",
+            "acute heart failure thromboprophylaxis heparin ESC",
+        ]
+
+    if snap.get("cad_terms"):
+        extra += [
+            "NSTE-ACS aspirin P2Y12 anticoagulation ESC",
+            "NSTE-ACS early invasive strategy guideline ESC",
+        ]
+
+    if snap.get("pe_terms"):
+        extra += [
+            "pulmonary embolism anticoagulation initial treatment ESC",
+        ]
+
+    # Query B should be slightly more treatment-heavy than Query A
+    if question_set.upper() == "B":
+        extra += [
+            "HFrEF start before discharge rapid up titration follow up ESC",
+            "acute heart failure transition intravenous to oral diuretics ESC",
+        ]
+
+    seen = {q.lower().strip() for q in queries if q}
+    out = list(queries)
+    for q in extra:
+        k = q.lower().strip()
+        if k not in seen:
+            seen.add(k)
+            out.append(q)
+    return out
 
 # ============================================================
 # QUERY GENERATION (pinned coverage queries)
@@ -356,7 +411,10 @@ def severity_assessment(snap: dict) -> dict:
 PINNED_QUERIES_A = [
     "acute heart failure criteria for hospital admission ESC",
     "acute heart failure ICU admission indications ESC",
+    "acute heart failure initial pharmacologic treatment diuretics ESC",
+    "acute heart failure oxygen therapy indications CPAP NIV ESC",
     "NSTE-ACS admission criteria ECG changes troponin ESC",
+    "NSTE-ACS aspirin P2Y12 anticoagulation guideline ESC",
     "pulmonary embolism diagnostic algorithm D-dimer rule-out ESC",
     "pulmonary embolism anticoagulation while awaiting diagnosis ESC",
 ]
@@ -364,12 +422,20 @@ PINNED_QUERIES_A = [
 PINNED_QUERIES_B = [
     "acute heart failure in-hospital monitoring level of care ESC",
     "acute heart failure identify precipitants triggers guideline ESC",
-    "pulmonary embolism outpatient vs inpatient management criteria ESC",
+    "acute heart failure intravenous loop diuretics thiazide ESC",
+    "HFrEF ACE inhibitor ARNI beta blocker MRA SGLT2 guideline ESC",
     "acute heart failure oxygen therapy indications CPAP NIV ESC",
+    "NSTE-ACS aspirin P2Y12 anticoagulation invasive strategy ESC",
+    "pulmonary embolism outpatient vs inpatient management criteria ESC",
+    "pulmonary embolism anticoagulation guideline ESC",
 ]
 
 
 def generate_queries(case_text: str, question_set: str, model: str = MODEL_NAME_DEFAULT) -> List[str]:
+    if not USE_DYNAMIC_QUERYGEN:
+        qs = list(PINNED_QUERIES_A if question_set.upper() == "A" else PINNED_QUERIES_B)
+        return augment_queries_for_treatment(case_text, question_set, qs)
+
     prompt = f"""
 Case:
 {case_text}
@@ -381,10 +447,11 @@ Generate 10 retrieval queries to pull ESC guideline text for:
 - admission vs discharge and monitoring level (ward vs CICU/ICU) if explicitly stated
 - ACS/NSTE-ACS workup pathways and monitoring if relevant
 - PE diagnostic + risk stratification algorithm if relevant
+- specific treatment classes when relevant (for example diuretics, oxygen/NIV, aspirin, P2Y12 inhibitor, anticoagulation, ACEi/ARNI, beta-blocker, MRA, SGLT2 inhibitor)
 
 Rules:
 - Queries 8–16 words.
-- Use words like: recommended, should, initial assessment, algorithm, admission, discharge, monitoring.
+- Use words like: recommended, should, initial assessment, algorithm, admission, discharge, monitoring, treatment.
 Return JSON only: {{"queries":[...]}}.
 """
     raw = call_gpt(QUERYGEN_SYSTEM, prompt, model=model, temperature=0.0, json_mode=True)
@@ -405,8 +472,9 @@ Return JSON only: {{"queries":[...]}}.
         if q and k not in seen:
             seen.add(k)
             out.append(q)
-    return out
 
+    out = augment_queries_for_treatment(case_text, question_set, out)
+    return out
 
 # ============================================================
 # FAISS LOAD + SEARCH
@@ -547,7 +615,7 @@ def build_context_bundle_from_queries(queries: List[str], top_k_final: int = 16)
 def build_prompt_query_A(case_text: str, bundle: dict) -> str:
     snap = parse_case_snapshot(case_text)
     return f"""
-{PROGNOSIS_SCALE_TEXT_1_7}
+{PROGNOSIS_SCALE_TEXT_1_8}
 
 CASE_TEXT:
 {case_text}
@@ -578,22 +646,39 @@ Return JSON with this exact structure:
     "clinical_judgment":"patient-specific reasoning, uncited"
   }},
   "prognosis": [
-    {{"dx":"string","score_1_to_7":1,"confidence_0_to_1":0.0,
+    {{"dx":"string","score_1_to_8":1,"confidence_0_to_1":0.0,
       "justification":"patient-specific reasoning, uncited",
       "evidence":[{{"chunk_id":"..."}}]}}
   ],
   "safety_critical": [
     {{"item":"string","action":"string","why":"string","evidence":[{{"chunk_id":"..."}}],"severity":"HIGH|MED|LOW"}}
-  ]
+  ],
+  "excel_codes": {{
+    "diagnoses":[1,2,3],
+    "new_tni_rag":0,
+    "er_rag_echo":0,
+    "er_rag_ct":0,
+    "er_rag_ctpa":0,
+    "er_rag_us":0,
+    "discharge_ai_rag":0,
+    "depar_rag":1,
+    "prognosis_rag":[1,2,3]
+  }}
 }}
 
 Constraints:
 - differential exactly 3; probabilities sum to 1.0
 - tests max 7
 - prognosis exactly 3; dx match differential dx order
-- scores 1–7
+- scores 1–8
 - Default evidence=[] for differential and prognosis unless citing a PURE guideline definition.
 - Do NOT use ESC citations for patient-specific labs/ECG/CXR/ABG.
+- excel_codes.diagnoses must map differential dx to this codebook:
+  1 HFrEF, 2 HFmrEF, 3 HFpEF, 4 ADHF generic, 5 STEMI, 6 NSTEMI, 7 acute pulmonary oedema generic, 8 PE, 9 COPD, 10 respiratory infection, 11 respiratory infection + HF, 12 valve disease, 13 VT/NSVT, 14 AF, 15 other.
+- excel_codes test flags are 0/1 except er_rag_ct (0 no, 1 thorax, 2 abdomen, 3 brain) and er_rag_us (0 no, 1 thorax/lung, 2 abdomen, 3 brain, 4 limb/venous).
+- excel_codes.discharge_ai_rag: 1 only if final recommendation is discharge from ER; otherwise 0.
+- excel_codes.depar_rag: 1 cardiology, 2 CICU, 3 respiratory, 4 internal medicine, 5 ICU, 6 surgical.
+- Code tests as 1 only if recommended for this patient now/ER/inpatient, not merely mentioned as conditional if deterioration occurs.
 Return ONLY JSON.
 """.strip()
 
@@ -601,7 +686,7 @@ Return ONLY JSON.
 def build_prompt_query_B(case_text_post: str, bundle: dict) -> str:
     snap = parse_case_snapshot(case_text_post)
     return f"""
-{PROGNOSIS_SCALE_TEXT_1_7}
+{PROGNOSIS_SCALE_TEXT_1_8}
 
 {HDS_SCALE_TEXT_1_5}
 
@@ -619,7 +704,7 @@ Return JSON with this exact structure:
 
 {{
   "prognosis": {{
-    "score_1_to_7":1,
+    "score_1_to_8":1,
     "confidence_0_to_1":0.0,
     "guideline_support":"ESC-only statement + [chunk_id] citations OR 'No direct guideline citation retrieved for this point.'",
     "clinical_judgment":"patient-specific reasoning, uncited"
@@ -665,15 +750,72 @@ Return JSON with this exact structure:
       "guideline_support":"ESC-only + [chunk_id] OR 'No direct guideline citation retrieved for this point.'",
       "clinical_judgment":"uncited"
     }}
-  ]
+  ],
+  "excel_codes": {{
+    "prognosis_rag_final":1,
+    "cause_decompensation_rag":1,
+    "departm_rag":0,
+    "days_hosp_rag":1,
+    "diuretics_rag":0,
+    "diuretics_rag_day":null,
+    "diuretics_rag_per_os_day":null,
+    "vasodilators_rag":0,
+    "vasodilators_rag_day":null,
+    "intubation_rag":0,
+    "intubation_rag_day":null,
+    "niv_rag":0,
+    "niv_rag_day":null,
+    "abx_rag":0,
+    "abx_rag_day":null,
+    "inotropes_rag":0,
+    "inotropes_rag_day":null,
+    "ace_arb_arni_rag":0,
+    "ace_arb_arni_rag_day":null,
+    "bb_rag":0,
+    "bb_rag_day":null,
+    "sglt2_rag":0,
+    "sglt2_rag_day":null,
+    "mra_rag":0,
+    "mra_rag_day":null,
+    "antiarrhythmic_rag":0,
+    "antiarrhythmic_rag_day":null,
+    "echo_rag":0,
+    "echo_rag_day":null,
+    "coro_rag":0,
+    "coro_rag_day":null,
+    "ctca_rag":0,
+    "ctca_rag_day":null,
+    "ct_rag":0,
+    "ct_rag_day":null,
+    "ctpa_rag":0,
+    "ctpa_rag_day":null,
+    "mri_rag":0,
+    "mri_rag_in_hospital":0,
+    "icd_rag":0,
+    "icd_rag_in_hospital":0,
+    "interrogation_rag":0,
+    "holter_rag":0,
+    "holter_rag_in_hospital":0,
+    "aortic_valve_repair_rag":0,
+    "aortic_method_repair":null,
+    "mitral_valve_repair_rag":0,
+    "mitral_method_repair":null
+  }}
 }}
 
 Constraints:
 - cause_workup_algorithm 6–10 steps
-- prognosis 1–7
+- prognosis 1–8
 - HDS 1–5
-- No dosing.
+- In treatment_plan_by_day, name specific medication classes when supported by retrieved ESC excerpts; do NOT use only vague phrases like "GDMT" or "optimize therapy" if a more specific class-level recommendation is supported.
+- Allowed specificity: medication class names only (e.g. intravenous loop diuretic, aspirin, P2Y12 inhibitor, anticoagulation, ACE inhibitor / ARNI, beta-blocker, MRA, SGLT2 inhibitor, intravenous vasodilator, thromboprophylaxis). No dosing.
 - Do NOT cite ESC for patient-specific facts.
+- excel_codes must encode only the patient-specific recommendation, not generic possibilities in guideline_support.
+- Code 1 only when the action is recommended/planned for this patient; code 0 when it is merely "if worsening", "if hypoxaemia develops", "if indicated", "consider only if", or part of a generic escalation criterion.
+- For fields where the workbook allows a "consider" code, use it only for an active patient-specific consideration: intubation_rag 2 = possible, inotropes_rag 2 = consider due to low BP, 3 = consider to support diuresis, 4 = both; ctpa_rag 2 = yes if not sure ADHF.
+- cause_decompensation_rag codebook: 1 oedema/volume overload, 2 arrhythmia, 3 tachycardia, 4 infection, 5 diet, 6 drug related/nonadherence, 7 type II MI/MINOCA, 8 hypertensive crisis, 9 no decompensation, 10 other, 11 end-stage/inotrope-dependent, 12 valve disease.
+- departm_rag: 0 cardiology department, 1 CICU.
+- days_hosp_rag: 1 discharged ER, 2 short stay 1-2 days, 3 standard 3-5 days, 4 prolonged 6-10 days, 5 extended >10 days, 6 moved to other department.
 Return ONLY JSON.
 """.strip()
 
@@ -736,6 +878,15 @@ def generate_targeted_queries_from_issues(issues: List[dict], max_new: int = 6) 
 # HARD VALIDATORS
 # ============================================================
 
+def _get_prognosis_score(item: dict) -> int:
+    return int(item.get("score_1_to_8", item.get("score_1_to_7", 0)) or 0)
+
+
+def _set_prognosis_score(item: dict, value: int) -> None:
+    item.pop("score_1_to_7", None)
+    item["score_1_to_8"] = int(value)
+
+
 def validate_query_A_shape(resp: dict) -> None:
     if len(resp.get("differential", [])) != 3:
         raise ValueError("Query A: differential must have exactly 3 items.")
@@ -751,19 +902,25 @@ def validate_query_A_shape(resp: dict) -> None:
     if len(resp.get("tests", [])) > 7:
         raise ValueError("Query A: tests must be <= 7 items.")
     for p in resp["prognosis"]:
-        s = int(p.get("score_1_to_7", 0))
-        if not (1 <= s <= 7):
-            raise ValueError("Query A: prognosis score must be 1–7.")
+        s = _get_prognosis_score(p)
+        if not (1 <= s <= 8):
+            raise ValueError("Query A: prognosis score must be 1–8.")
 
 
 def validate_query_B_shape(resp: dict) -> None:
     algo = resp.get("cause_workup_algorithm", [])
     if not (6 <= len(algo) <= 10):
         raise ValueError("Query B: cause_workup_algorithm must be 6–10 steps.")
-    s = int(resp.get("prognosis", {}).get("score_1_to_7", 0))
-    if not (1 <= s <= 7):
-        raise ValueError("Query B: prognosis score must be 1–7.")
-    h = int(resp.get("estimated_duration", {}).get("hds_score_1_to_5", 0))
+    prognosis = resp.get("prognosis", {})
+    if not isinstance(prognosis, dict):
+        raise ValueError("Query B: prognosis must be an object.")
+    s = _get_prognosis_score(prognosis)
+    if not (1 <= s <= 8):
+        raise ValueError("Query B: prognosis score must be 1–8.")
+    estimated_duration = resp.get("estimated_duration", {})
+    if not isinstance(estimated_duration, dict):
+        raise ValueError("Query B: estimated_duration must be an object.")
+    h = int(estimated_duration.get("hds_score_1_to_5", 0))
     if not (1 <= h <= 5):
         raise ValueError("Query B: HDS score must be 1–5.")
 
@@ -846,9 +1003,9 @@ def cap_queryA_prognosis_if_no_icu_triggers(resp: dict, snap: dict) -> dict:
     """
     if not needs_icu_by_triggers(snap):
         for p in _ensure_list(resp.get("prognosis")):
-            s = int(p.get("score_1_to_7", 0))
+            s = _get_prognosis_score(p)
             if s >= 5:
-                p["score_1_to_7"] = 4
+                _set_prognosis_score(p, 4)
                 p["confidence_0_to_1"] = min(float(p.get("confidence_0_to_1", 0.6)), 0.65)
                 p["justification"] = (
                     (p.get("justification", "") or "").strip()
@@ -868,7 +1025,33 @@ def strip_evidence_from_differential_and_prognosis(resp: dict) -> dict:
         p["evidence"] = []
     return resp
 
+def flag_vague_treatment_language_queryB(resp: dict) -> dict:
+    """
+    Non-destructive helper:
+    if the model uses only vague treatment language in Query B, nudge clinical_judgment
+    but do not overwrite medically specific content if already present.
+    """
+    vague_terms = ["gdmt", "optimize therapy", "optimize guideline-directed", "guideline-directed therapy"]
+    class_terms = [
+        "diuretic", "loop diuretic", "thiazide", "aspirin", "p2y12", "anticoag",
+        "ace", "arb", "arni", "beta-block", "mra", "sglt2", "vasodilator",
+        "oxygen", "ventilation", "heparin"
+    ]
 
+    for block in _ensure_list(resp.get("treatment_plan_by_day")):
+        actions = block.get("actions", [])
+        joined = " ".join(actions).lower()
+
+        has_vague = any(v in joined for v in vague_terms)
+        has_specific = any(c in joined for c in class_terms)
+
+        if has_vague and not has_specific:
+            cj = (block.get("clinical_judgment") or "").strip()
+            addon = " Prefer naming treatment classes explicitly rather than only using generic terms like GDMT."
+            if addon not in cj:
+                block["clinical_judgment"] = (cj + addon).strip()
+
+    return resp
 # ============================================================
 # ANSWER FUNCTIONS
 # ============================================================
@@ -959,6 +1142,7 @@ def answer_query_B_with_verification(
     draft_prompt = build_prompt_query_B(case_text_post, bundle)
     raw = call_gpt(DRAFT_SYSTEM, draft_prompt, model=model, temperature=0.0, json_mode=True)
     candidate = _safe_extract_json(raw)
+    candidate = flag_vague_treatment_language_queryB(candidate)
 
     verifier_reports = []
     final_queries = list(base_queries)
@@ -992,6 +1176,7 @@ def answer_query_B_with_verification(
             bundle = build_context_bundle_from_queries(final_queries, top_k_final=top_k_reretrieval)
 
         candidate = revise_answer(bundle["context_text"], candidate, report, model=model)
+        candidate = flag_vague_treatment_language_queryB(candidate)
 
     validate_query_B_shape(candidate)
 
@@ -1037,6 +1222,7 @@ def answer_query_B_single_pass(
     prompt = build_prompt_query_B(case_text_post, bundle)
     raw = call_gpt(DRAFT_SYSTEM, prompt, model=model, temperature=0.0, json_mode=True)
     resp = _safe_extract_json(raw)
+    resp = flag_vague_treatment_language_queryB(resp)
     validate_query_B_shape(resp)
     debug = {"queries": queries, "top_table": bundle["top_table"], "case_snapshot": snap}
     return resp, debug
@@ -1046,14 +1232,15 @@ def answer_query_B_single_pass(
 # PRETTY PRINTERS (DOCTOR READABLE)
 # ============================================================
 
-PROGNOSIS_SCALE_1_7 = {
+PROGNOSIS_SCALE_1_8 = {
     1: "Safe for Discharge from ER",
     2: "Short Observation (<24h)",
     3: "Short Admission (1–3 days)",
     4: "Standard Admission (3–7 days)",
     5: "Prolonged Admission (>7 days)",
-    6: "High Risk of ICU/Intubation",
-    7: "High Risk of Death (In-hospital)",
+    6: "High Risk of ICU",
+    7: "High Risk of Intubation",
+    8: "High Risk of Death (In-hospital)",
 }
 
 HDS_SCALE_1_5 = {
@@ -1094,10 +1281,11 @@ def pretty_query_A(resp: dict) -> str:
     lines.append(f"  Clinical judgment: {disp['clinical_judgment']}")
     lines.append("")
 
-    lines.append("4) Prognosis (1–7)")
+    lines.append("4) Prognosis (1–8)")
     for p in resp["prognosis"]:
-        label = PROGNOSIS_SCALE_1_7.get(p["score_1_to_7"], "Unknown")
-        lines.append(f"  - {p['dx']}: {p['score_1_to_7']} — {label} (conf={p['confidence_0_to_1']:.2f})")
+        score = _get_prognosis_score(p)
+        label = PROGNOSIS_SCALE_1_8.get(score, "Unknown")
+        lines.append(f"  - {p['dx']}: {score} — {label} (conf={p['confidence_0_to_1']:.2f})")
         lines.append(f"    {p['justification']}")
     lines.append("")
 
@@ -1119,7 +1307,8 @@ def pretty_query_B(resp: dict) -> str:
 
     prog = resp["prognosis"]
     lines.append("6) Prognosis")
-    lines.append(f"  Score (1–7): {prog['score_1_to_7']}  (conf={prog['confidence_0_to_1']:.2f})")
+    score = _get_prognosis_score(prog)
+    lines.append(f"  Score (1–8): {score}  (conf={prog['confidence_0_to_1']:.2f})")
     lines.append(f"  Guideline support: {prog['guideline_support']}")
     lines.append(f"  Clinical judgment: {prog['clinical_judgment']}")
     lines.append("")
