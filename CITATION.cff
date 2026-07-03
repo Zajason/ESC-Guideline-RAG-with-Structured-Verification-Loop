@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+title: "ESC-Guideline RAG with Structured Verification Loop"
+message: "If you use this repository, please cite it using this metadata."
+type: software
+authors:
+  - family-names: "Repository authors"
+    given-names: "ESC-Guideline RAG contributors"
+repository-code: "https://github.com/Zajason/ESC-Guideline-RAG-with-Structured-Verification-Loop"
+abstract: "A research-oriented retrieval-augmented generation system for structured ESC-guideline clinical reasoning and prognosis benchmarking."
+keywords:
+  - retrieval-augmented generation
+  - cardiology
+  - heart failure
+  - ESC guidelines
+  - clinical NLP
+license: MIT
+version: 0.2.0
+date-released: "2026-07-03"

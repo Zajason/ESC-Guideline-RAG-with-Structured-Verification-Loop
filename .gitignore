@@ -10,6 +10,29 @@
 !*.ipynb
 !*.md
 !.gitignore
+!.env.example
+!LICENSE
+!CITATION.cff
+!CONTRIBUTING.md
+!SECURITY.md
+!pyproject.toml
+!requirements.txt
+
+# -----------------------------
+# Keep public project folders
+# -----------------------------
+!.github/
+!.github/**
+!docs/
+!docs/**
+!examples/
+!examples/**
+!esc_rag/
+!esc_rag/**
+!scripts/
+!scripts/**
+!tests/
+!tests/**
 
 # -----------------------------
 # Keep artifacts folder
@@ -25,6 +48,15 @@ __pycache__/
 .ipynb_checkpoints/
 esc_data/
 runs/
+batch_runs/
+swisstransfer_*/
+*.xlsx
+*.xls
+*.docx
+*.pages
+.env
+.env.*
+!.env.example
 
 # -----------------------------
 # Python cache

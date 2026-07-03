@@ -307,6 +307,13 @@ def copy_excel_codes(excel_codes: dict[str, Any], mapping: dict[str, str]) -> di
     return out
 
 
+def clamp_int(value: Any, allowed: set[int], default: int | None = None) -> int | None:
+    ivalue = as_int_or_none(value)
+    if ivalue in allowed:
+        return ivalue
+    return default
+
+
 def action_text(block: dict[str, Any]) -> str:
     if not isinstance(block, dict):
         return ""
@@ -474,9 +481,30 @@ def query_a_values(resp: dict[str, Any]) -> dict[str, Any]:
 
     prognosis = resp.get("prognosis", [])
     for i, key in enumerate(["prog_a1", "prog_a2", "prog_a3"]):
-        if key not in out and i < len(prognosis):
+        if i < len(prognosis):
             out[key] = get_score(prognosis[i])
+    normalize_query_a_codebook(out)
     return out
+
+
+def normalize_query_a_codebook(out: dict[str, Any]) -> None:
+    allowed_sets = {
+        "diag1": set(range(1, 16)),
+        "diag2": set(range(1, 16)),
+        "diag3": set(range(1, 16)),
+        "er_ct": {0, 1, 2, 3},
+        "er_us": {0, 1, 2, 3, 4},
+        "department_a": {1, 2, 3, 4, 5, 6},
+        "prog_a1": set(range(1, 9)),
+        "prog_a2": set(range(1, 9)),
+        "prog_a3": set(range(1, 9)),
+    }
+    for key in ["new_tni", "er_echo", "er_ctpa", "discharge"]:
+        if key in out:
+            out[key] = 1 if as_int_or_none(out[key]) and as_int_or_none(out[key]) > 0 else 0
+    for key, allowed in allowed_sets.items():
+        if key in out:
+            out[key] = clamp_int(out.get(key), allowed)
 
 
 def treatment_blocks(resp: dict[str, Any]) -> list[dict[str, Any]]:
@@ -618,7 +646,91 @@ def query_b_values(resp: dict[str, Any]) -> dict[str, Any]:
     else:
         out.setdefault("mitral_valve", 0)
 
+    normalize_query_b_codebook(out, blocks)
+    rescue_query_b_prognosis_from_response(out, resp)
     return out
+
+
+def rescue_query_b_prognosis_from_response(out: dict[str, Any], resp: dict[str, Any]) -> None:
+    text = all_text(resp)
+    current = as_int_or_none(out.get("prog_b")) or 0
+    hds = as_int_or_none(out.get("hds")) or 0
+    cause = as_int_or_none(out.get("cause"))
+    rescued = current
+
+    if re.search(r"\blactate\s*(?:=|of)?\s*[67](?:\.\d+)?", text) or "very high lactate" in text:
+        rescued = max(rescued, 8)
+    if ("gcs 8" in text or "gcs=8" in text) and contains_any(text, ["severe renal", "creatinine", "azotemia", "aki", "ckd"]):
+        rescued = max(rescued, 8)
+    if cause == 11 and hds == 5 and contains_any(text, ["end-stage", "inotrope-dependent"]):
+        rescued = max(rescued, 8)
+    if contains_any(text, ["high-grade av block", "3:1 conduction", "ventricular rate of 30", "ventricular rate 30"]):
+        rescued = max(rescued, 8)
+    if rescued != current:
+        out["prog_b"] = rescued
+
+
+def normalize_query_b_codebook(out: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
+    """Keep model-supplied excel_codes inside the workbook's expected codebooks."""
+    simple_binary_fields = [
+        "abx", "ace_arb_arni", "bb", "sglt2", "mra", "antiarrhythmic",
+        "echo_b", "ctca", "ct_b", "mri", "mri_in_hosp", "icd_in_hosp",
+        "interrogation", "holter", "holter_in_hosp",
+    ]
+    for key in simple_binary_fields:
+        if key in out:
+            out[key] = 1 if as_int_or_none(out[key]) and as_int_or_none(out[key]) > 0 else 0
+
+    vasodilator_terms = ["vasodilator", "nitrate", "nitroglycerin", "nitroprusside"]
+    if clamp_int(out.get("vasodilators"), {0, 1}) is None:
+        out["vasodilators"] = 1 if blocks_with_terms(blocks, vasodilator_terms) else 0
+
+    niv_terms = ["non-invasive ventilation", "non invasive ventilation", "niv", "cpap", "bipap"]
+    if clamp_int(out.get("niv"), {0, 1}) is None:
+        out["niv"] = 1 if any_definite_action(blocks, niv_terms) else 0
+
+    if not out.get("vasodilators"):
+        out.pop("vasodilators_day", None)
+    if not out.get("niv"):
+        out.pop("niv_day", None)
+
+    allowed_sets = {
+        "prog_b": set(range(1, 9)),
+        "cause": set(range(1, 13)),
+        "department_b": {0, 1},
+        "hds": set(range(1, 7)),
+        "diuretics": {0, 1, 2},
+        "intubation": {0, 1, 2},
+        "ctpa_b": {0, 1, 2},
+        "inotropes": {0, 1, 2, 3, 4},
+        "coro": {0, 1},
+        "icd": {0, 1, 2, 3, 4, 5, 6},
+        "aortic_valve": {0, 1, 2, 3},
+        "aortic_method": {1, 2},
+        "mitral_valve": {0, 1, 2, 3},
+        "mitral_method": {1, 2},
+    }
+    defaults = {
+        "prog_b": 4,
+        "cause": 10,
+        "department_b": 0,
+        "hds": 3,
+        "diuretics": 0,
+        "intubation": 0,
+        "ctpa_b": 0,
+        "inotropes": 0,
+        "coro": 1 if any_definite_action(blocks, ["coronary angiography", "invasive coronary", "coronarography"]) else 0,
+        "icd": 0,
+        "aortic_valve": 0,
+        "mitral_valve": 0,
+    }
+    for key, allowed in allowed_sets.items():
+        if key in out:
+            out[key] = clamp_int(out.get(key), allowed, defaults.get(key))
+
+    for key in ["aortic_method", "mitral_method"]:
+        if key in out and out[key] is None:
+            out.pop(key, None)
 
 
 def compact_debug(debug: dict[str, Any]) -> dict[str, Any]:

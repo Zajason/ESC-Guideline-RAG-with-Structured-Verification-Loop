@@ -17,6 +17,26 @@ This system is designed to:
 - Reduce hallucination and over-escalation (e.g., unnecessary ICU assignment)
 - Populate the research Excel workbook with RAG-only structured codes
 
+## Repository Contents
+
+```text
+rag_core.py                  # Main RAG pipeline, prompts, retrieval, verification, calibration
+batch_fill_rag_excel.py      # Private workbook population workflow
+esc_rag/                     # Public, dependency-light helpers for metrics/codebooks/calibration
+scripts/evaluate_models.py   # Workbook prognosis benchmark report
+scripts/run_demo.py          # Public synthetic demo, no API or patient data
+tests/                       # Public unit tests for calibration, codebooks, metrics
+examples/                    # Synthetic, non-patient demo cases and model comparison data
+docs/                        # Architecture, evaluation, and data privacy notes
+```
+
+The public demo and tests do not require private patient data or an OpenAI API key.
+
+```bash
+python -m unittest discover -s tests
+python scripts/run_demo.py
+```
+
 ---
 
 ## Current Defaults
@@ -27,6 +47,27 @@ This system is designed to:
 - Verification loop: optional via `--verified`
 - Dynamic LLM query generation: off by default; pinned ESC/HFrEF queries are used to reduce API calls
 - Excel coding: the RAG prompts now request explicit `excel_codes` so workbook population does not rely only on prose parsing
+
+## Current Benchmark Position
+
+In the latest calibrated workbook, the RAG system is strongest where guideline grounding and structured output matter most:
+
+- **Best ordinal final-prognosis error**: RAG had the lowest mean absolute error for final prognosis (`0.77`), meaning its wrong answers were less wrong on the 1-8 scale.
+- **Best post-diagnosis department assignment**: RAG had the highest agreement for cardiology vs CICU after diagnosis (`70.7%`).
+- **Best treatment/workup macro-average**: RAG had the best overall exact agreement across the checked management fields (`81.7%`).
+- **Better final-prognosis exact accuracy than DEEP and C+** after high-risk calibration: RAG `41.3%`, DEEP `25.3%`, C+ `26.7%`.
+- **RAG remained below CHAT for exact final prognosis**: CHAT `48.0%`, RAG `41.3%`. However, RAG's ordinal error was better, so it was usually closer when it missed.
+
+Model labels in the research workbook:
+
+- **CHAT** = non-paid ChatGPT version used externally.
+- **C+** = the user's paid ChatGPT / premium model run.
+- **DEEP** = DeepSeek-style comparison run.
+- **RAG** = this ESC-guideline retrieval-augmented system using structured prompts, citation rules, code validation, and prognosis calibration.
+
+The current positioning is therefore not simply "RAG wins every column." The more accurate claim is:
+
+> RAG gives more auditable, guideline-grounded answers, beats the comparison models on structured management decisions, beats DEEP/C+ on calibrated final prognosis, and has the lowest ordinal prognosis error even when CHAT has higher exact-category accuracy.
 
 ## What Makes This System Different
 
@@ -170,7 +211,8 @@ Many LLM systems over-escalate. This system includes **rule-based gating**.
 
 Additional rules:
 
-- Prognosis scores **≥ 5** are capped unless ICU triggers exist
+- Prognosis calibration is ordinal: **5** is allowed for prolonged/complex admission even without ICU triggers, while **6–8** require instability, intubation risk, or mortality-risk physiology
+- High-risk prognosis rescue promotes compressed score-6 cases when objective markers are present, including very high lactate, low GCS with renal failure, end-stage/inotrope-dependent HF, high-grade AV block with ventricular rate around 30/min, or combined lactate/renal/CICU physiology
 - Hyperkalemia, troponin rise, and high FiO₂ add safety flags but do not force ICU
 
 Prevents:
@@ -188,6 +230,7 @@ Two calibrated scales are used.
 
 - **1** = Safe discharge  
 - **4** = Standard admission  
+- **5** = Prolonged/complex admission
 - **6** = High ICU risk
 - **7** = High intubation risk
 - **8** = High in-hospital mortality
@@ -337,8 +380,8 @@ Use this when previous RAG rows may have mapping issues and should be recomputed
 cd /Users/zak/research/med/RAG_AI/rag2.0
 
 ESC_RAG_MODEL=gpt-5.4-mini .venv/bin/python batch_fill_rag_excel.py \
-  --excel "../Final AI & HFrEF patients list_RAG_filled_20260504-141028.xlsx" \
-  --output "../Final AI & HFrEF patients list_RAG_refilled_gpt54mini.xlsx" \
+  --excel "../Final AI & HFrEF patients list_RAG_refilled_gpt54mini_highrisk_calibrated.xlsx" \
+  --output "../Final AI & HFrEF patients list_RAG_refilled_gpt54mini_rerun.xlsx" \
   --overwrite \
   --rerun-complete \
   --max-retries 5 \
@@ -381,6 +424,8 @@ Important coding rule:
 
 - Code a therapy/investigation as positive only when recommended for the patient.
 - Do **not** code generic escalation language as positive, e.g. "intubate if worsening" or "CTPA if ADHF uncertain", unless the workbook has a matching "possible/conditional" code.
+- The batch mapper now validates Query B codes before writing Excel. Binary fields such as `vasodilators_rag`, `niv_rag`, and `coro_rag` are clamped to `0/1`; `vasodilators=2` is treated as an active patient-specific consideration when vasodilators are discussed, while `niv=2` is written as `1` only if NIV is definitely planned.
+- Coronary angiography (`coro_rag`) is kept binary and should be positive only for a patient-specific invasive coronary angiography recommendation.
 
 This change was added because narrative parsing overcalled some actions in prior runs, especially:
 
@@ -455,6 +500,3 @@ This enables:
 ## Disclaimer
 
 This system is for research purposes only and is not intended for clinical decision-making.
-
-
-

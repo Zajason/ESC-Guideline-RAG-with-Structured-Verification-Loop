@@ -1,0 +1,11 @@
+CODE: SYNTH-002
+
+Query A case text:
+A 76-year-old patient presents with severe dyspnea, blood pressure = 86/54, heart rate = 118 bpm, SpO2 = 84% on oxygen, FiO2 = 50%, potassium = 6.3, creatinine = 2.7, lactate = 6.8, GCS = 13/15. Chest x-ray shows pulmonary edema.
+
+Now I will tell you that the patient has advanced HFrEF with severe biventricular dysfunction and suspected infection-triggered decompensation. Bedside echo shows LVEF 15%, severe RV dysfunction, and no acute mechanical complication.
+
+Expected behavior:
+- CICU/ICU-level risk.
+- High-risk prognosis rescue should promote mortality-risk category.
+- Hyperkalemia, renal dysfunction, lactate, and hypoxemia should be surfaced as safety-critical.

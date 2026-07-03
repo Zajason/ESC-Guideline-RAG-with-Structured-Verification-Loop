@@ -116,6 +116,14 @@ PROGNOSIS SCALE (1–8):
 6 = High Risk of ICU — Hemodynamic or respiratory instability; ICU likely.
 7 = High Risk of Intubation — Impending or established respiratory failure; intubation likely.
 8 = High Risk of Death (In-hospital) — Critical illness; multiorgan risk or very poor reserve.
+
+CALIBRATION RULES:
+- Do not compress all admitted patients into 4. Use 5 when prolonged/complex admission is likely even if ICU is not yet required.
+- Use 5 for slow response or complicated inpatient management: renal dysfunction, severe hyperkalemia, severe valve disease, repeated ischemic evaluation, frailty/poor reserve, or expected stay >7 days.
+- Use 6 for shock physiology, high lactate, high oxygen requirement, altered mental status, or other features making CICU/ICU likely.
+- Use 7 when respiratory failure or intubation is a realistic near-term risk.
+- Use 8 only for very high in-hospital mortality risk: multiorgan dysfunction, refractory shock/hypoxemia, severe lactate elevation, or very poor reserve.
+- The scale is ordinal; if features fit between two categories, choose the higher score only when the patient-specific data support it.
 """.strip()
 
 HDS_SCALE_TEXT_1_5 = """
@@ -813,6 +821,9 @@ Constraints:
 - excel_codes must encode only the patient-specific recommendation, not generic possibilities in guideline_support.
 - Code 1 only when the action is recommended/planned for this patient; code 0 when it is merely "if worsening", "if hypoxaemia develops", "if indicated", "consider only if", or part of a generic escalation criterion.
 - For fields where the workbook allows a "consider" code, use it only for an active patient-specific consideration: intubation_rag 2 = possible, inotropes_rag 2 = consider due to low BP, 3 = consider to support diuresis, 4 = both; ctpa_rag 2 = yes if not sure ADHF.
+- These excel_codes are strictly binary 0/1: vasodilators_rag, niv_rag, abx_rag, ace_arb_arni_rag, bb_rag, sglt2_rag, mra_rag, antiarrhythmic_rag, echo_rag, coro_rag, ctca_rag, ct_rag, mri_rag, mri_rag_in_hospital, interrogation_rag, holter_rag, holter_rag_in_hospital.
+- For vasodilators_rag, use 1 for an active patient-specific recommendation or active consideration because BP/congestion allow it; use 0 for generic or conditional-only escalation. For niv_rag, use 1 only when non-invasive ventilation is actively recommended/planned now, not just "reassess if respiratory distress worsens".
+- coro_rag is binary: 1 only for patient-specific invasive coronary angiography/coronary angiography recommendation, 0 otherwise.
 - cause_decompensation_rag codebook: 1 oedema/volume overload, 2 arrhythmia, 3 tachycardia, 4 infection, 5 diet, 6 drug related/nonadherence, 7 type II MI/MINOCA, 8 hypertensive crisis, 9 no decompensation, 10 other, 11 end-stage/inotrope-dependent, 12 valve disease.
 - departm_rag: 0 cardiology department, 1 CICU.
 - days_hosp_rag: 1 discharged ER, 2 short stay 1-2 days, 3 standard 3-5 days, 4 prolonged 6-10 days, 5 extended >10 days, 6 moved to other department.
@@ -996,21 +1007,177 @@ def inject_severity_guardrails_queryA(resp: dict, snap: dict) -> dict:
     return resp
 
 
-def cap_queryA_prognosis_if_no_icu_triggers(resp: dict, snap: dict) -> dict:
+def mortality_risk_trigger_count(snap: dict) -> int:
+    count = 0
+    bp = snap.get("bp")
+    spo2 = snap.get("spo2")
+    fio2 = snap.get("fio2")
+    if bp and bp["sys"] < 90:
+        count += 1
+    if snap.get("lactate") is not None and snap["lactate"] >= 4.0:
+        count += 1
+    if snap.get("gcs") is not None and snap["gcs"] < 15:
+        count += 1
+    if fio2 is not None and fio2 >= 0.50 and spo2 is not None and spo2 < 90:
+        count += 1
+    if snap.get("k") is not None and snap["k"] >= 6.5:
+        count += 1
+    if snap.get("creatinine") is not None and snap["creatinine"] >= 2.5:
+        count += 1
+    return count
+
+
+def complex_admission_likely(snap: dict) -> bool:
+    k = snap.get("k")
+    cr = snap.get("creatinine")
+    fio2 = snap.get("fio2")
+    spo2 = snap.get("spo2")
+    return any(
+        [
+            k is not None and k >= 5.8,
+            cr is not None and cr >= 1.5,
+            fio2 is not None and fio2 >= 0.40,
+            spo2 is not None and spo2 < 93,
+        ]
+    )
+
+
+def prognosis_floor_from_case(snap: dict, hds_score: int | None = None, intubation_code: int | None = None) -> int:
+    if mortality_risk_trigger_count(snap) >= 3:
+        return 8
+    if intubation_code in {1, 2}:
+        return 7
+    if needs_icu_by_triggers(snap):
+        return 6
+    if (hds_score is not None and hds_score >= 4) or complex_admission_likely(snap):
+        return 5
+    return 1
+
+
+def high_risk_prognosis_rescue(resp: dict, snap: dict, base_score: int) -> int:
     """
-    Avoid inflating to score 5 just because things look scary but stable.
-    If NO ICU triggers, cap score at 4.
+    Promote only objective, patient-specific high-risk patterns that the base LLM
+    tended to compress into score 6.
     """
-    if not needs_icu_by_triggers(snap):
-        for p in _ensure_list(resp.get("prognosis")):
-            s = _get_prognosis_score(p)
-            if s >= 5:
-                _set_prognosis_score(p, 4)
-                p["confidence_0_to_1"] = min(float(p.get("confidence_0_to_1", 0.6)), 0.65)
-                p["justification"] = (
-                    (p.get("justification", "") or "").strip()
-                    + " No clear shock/respiratory-failure triggers provided; prognosis score capped to standard admission."
-                ).strip()
+    text = json.dumps(resp, ensure_ascii=False).lower()
+    hds_score = None
+    estimated_duration = resp.get("estimated_duration", {})
+    if isinstance(estimated_duration, dict):
+        try:
+            hds_score = int(estimated_duration.get("hds_score_1_to_5"))
+        except Exception:
+            hds_score = None
+    excel_codes = resp.get("excel_codes", {})
+    cause_code = None
+    department_code = None
+    if isinstance(excel_codes, dict):
+        try:
+            cause_code = int(excel_codes.get("cause_decompensation_rag"))
+        except Exception:
+            cause_code = None
+        try:
+            department_code = int(excel_codes.get("departm_rag"))
+        except Exception:
+            department_code = None
+
+    score = base_score
+    if snap.get("lactate") is not None and snap["lactate"] >= 6.0:
+        score = max(score, 8)
+    if snap.get("gcs") is not None and snap["gcs"] <= 8 and (snap.get("creatinine") or 0) >= 2.5:
+        score = max(score, 8)
+    if cause_code == 11 and hds_score == 5 and ("end-stage" in text or "inotrope-dependent" in text):
+        score = max(score, 8)
+    if (
+        ("high-grade av block" in text or "3:1 conduction" in text or "ventricular rate 30" in text)
+        and (snap.get("hr") or 999) <= 35
+    ):
+        score = max(score, 8)
+    if (
+        score < 7
+        and (snap.get("lactate") or 0) >= 3.0
+        and (snap.get("creatinine") or 0) >= 1.5
+        and (hds_score or 0) >= 4
+        and department_code == 1
+    ):
+        score = max(score, 7)
+    if (
+        score < 7
+        and (snap.get("lactate") or 0) >= 2.0
+        and (snap.get("creatinine") or 0) >= 2.0
+        and (hds_score or 0) >= 4
+        and department_code == 1
+        and "severe" in text
+    ):
+        score = max(score, 7)
+    return score
+
+
+def calibrate_queryA_prognosis(resp: dict, snap: dict) -> dict:
+    """
+    Keep the 1-8 prognosis ordinal and avoid the old downward compression into 4.
+    Stable-but-complex cases may be 5; 6-8 still require instability/intubation/death-risk features.
+    """
+    floor = prognosis_floor_from_case(snap)
+    no_icu = not needs_icu_by_triggers(snap)
+    for p in _ensure_list(resp.get("prognosis")):
+        s = _get_prognosis_score(p)
+        if s <= 0:
+            continue
+        if no_icu and s >= 6:
+            s = 5 if complex_admission_likely(snap) else 4
+            p["confidence_0_to_1"] = min(float(p.get("confidence_0_to_1", 0.6)), 0.7)
+            p["justification"] = (
+                (p.get("justification", "") or "").strip()
+                + " Prognosis calibrated: no hard ICU trigger is present, so high-risk ICU scores are not used, but complex features can still justify prolonged admission."
+            ).strip()
+        if floor >= 5 and s < floor:
+            s = floor
+            p["confidence_0_to_1"] = min(float(p.get("confidence_0_to_1", 0.6)), 0.7)
+            p["justification"] = (
+                (p.get("justification", "") or "").strip()
+                + " Prognosis calibrated upward because the case has objective complexity/instability markers matching the ordinal scale."
+            ).strip()
+        _set_prognosis_score(p, min(max(s, 1), 8))
+    excel_codes = resp.get("excel_codes", {})
+    prognosis = _ensure_list(resp.get("prognosis"))
+    if isinstance(excel_codes, dict) and len(prognosis) == 3:
+        excel_codes["prognosis_rag"] = [_get_prognosis_score(p) for p in prognosis]
+    return resp
+
+
+def calibrate_queryB_prognosis(resp: dict, snap: dict) -> dict:
+    prognosis = resp.get("prognosis", {})
+    if not isinstance(prognosis, dict):
+        return resp
+    estimated_duration = resp.get("estimated_duration", {})
+    hds_score = None
+    if isinstance(estimated_duration, dict):
+        try:
+            hds_score = int(estimated_duration.get("hds_score_1_to_5"))
+        except Exception:
+            hds_score = None
+    excel_codes = resp.get("excel_codes", {})
+    intubation_code = None
+    if isinstance(excel_codes, dict):
+        try:
+            intubation_code = int(excel_codes.get("intubation_rag"))
+        except Exception:
+            intubation_code = None
+
+    floor = prognosis_floor_from_case(snap, hds_score=hds_score, intubation_code=intubation_code)
+    s = _get_prognosis_score(prognosis)
+    floor = max(floor, high_risk_prognosis_rescue(resp, snap, s))
+    if 1 <= s < floor:
+        _set_prognosis_score(prognosis, floor)
+        prognosis["confidence_0_to_1"] = min(float(prognosis.get("confidence_0_to_1", 0.6)), 0.7)
+        prognosis["clinical_judgment"] = (
+            (prognosis.get("clinical_judgment", "") or "").strip()
+            + " Prognosis calibrated upward because duration/instability markers fit a higher category on the 1-8 scale."
+        ).strip()
+        if isinstance(excel_codes, dict):
+            excel_codes["prognosis_rag_final"] = floor
+    elif isinstance(excel_codes, dict):
+        excel_codes["prognosis_rag_final"] = min(max(s, 1), 8)
     return resp
 
 
@@ -1075,7 +1242,7 @@ def answer_query_A_with_verification(
     # guardrails (safe defaults)
     candidate = strip_evidence_from_differential_and_prognosis(candidate)
     candidate = inject_severity_guardrails_queryA(candidate, snap)
-    candidate = cap_queryA_prognosis_if_no_icu_triggers(candidate, snap)
+    candidate = calibrate_queryA_prognosis(candidate, snap)
 
     verifier_reports = []
     final_queries = list(base_queries)
@@ -1113,7 +1280,7 @@ def answer_query_A_with_verification(
         # re-apply safe guardrails after revision
         candidate = strip_evidence_from_differential_and_prognosis(candidate)
         candidate = inject_severity_guardrails_queryA(candidate, snap)
-        candidate = cap_queryA_prognosis_if_no_icu_triggers(candidate, snap)
+        candidate = calibrate_queryA_prognosis(candidate, snap)
 
     validate_query_A_shape(candidate)
 
@@ -1143,6 +1310,7 @@ def answer_query_B_with_verification(
     raw = call_gpt(DRAFT_SYSTEM, draft_prompt, model=model, temperature=0.0, json_mode=True)
     candidate = _safe_extract_json(raw)
     candidate = flag_vague_treatment_language_queryB(candidate)
+    candidate = calibrate_queryB_prognosis(candidate, snap)
 
     verifier_reports = []
     final_queries = list(base_queries)
@@ -1177,6 +1345,7 @@ def answer_query_B_with_verification(
 
         candidate = revise_answer(bundle["context_text"], candidate, report, model=model)
         candidate = flag_vague_treatment_language_queryB(candidate)
+        candidate = calibrate_queryB_prognosis(candidate, snap)
 
     validate_query_B_shape(candidate)
 
@@ -1204,7 +1373,7 @@ def answer_query_A_single_pass(
 
     resp = strip_evidence_from_differential_and_prognosis(resp)
     resp = inject_severity_guardrails_queryA(resp, snap)
-    resp = cap_queryA_prognosis_if_no_icu_triggers(resp, snap)
+    resp = calibrate_queryA_prognosis(resp, snap)
 
     validate_query_A_shape(resp)
     debug = {"queries": queries, "top_table": bundle["top_table"], "case_snapshot": snap}
@@ -1223,6 +1392,7 @@ def answer_query_B_single_pass(
     raw = call_gpt(DRAFT_SYSTEM, prompt, model=model, temperature=0.0, json_mode=True)
     resp = _safe_extract_json(raw)
     resp = flag_vague_treatment_language_queryB(resp)
+    resp = calibrate_queryB_prognosis(resp, snap)
     validate_query_B_shape(resp)
     debug = {"queries": queries, "top_table": bundle["top_table"], "case_snapshot": snap}
     return resp, debug

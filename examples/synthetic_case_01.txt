@@ -1,0 +1,11 @@
+CODE: SYNTH-001
+
+Query A case text:
+An 82-year-old patient presents with acute dyspnea, orthopnea, bilateral basal crackles, blood pressure = 128/74, heart rate = 102 bpm, SpO2 = 94% on room air, potassium = 4.7, creatinine = 1.4, lactate = 1.2, GCS = 15/15. ECG shows known LBBB. Chest x-ray suggests pulmonary venous congestion.
+
+Now I will tell you that the patient has known HFrEF. Bedside echo shows LVEF 30%, mild mitral regurgitation, no severe valve lesion, and normal RV size. Troponin is stable. No fever or leukocytosis.
+
+Expected behavior:
+- Standard/prolonged cardiology admission rather than ICU.
+- Intravenous loop diuretic and reassessment.
+- Prognosis should not be inflated to death/intubation risk.

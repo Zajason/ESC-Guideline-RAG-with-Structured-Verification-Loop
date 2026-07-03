@@ -1,0 +1,13 @@
+[project]
+name = "esc-guideline-rag"
+version = "0.2.0"
+description = "Research-oriented ESC guideline RAG with structured verification and prognosis benchmarking."
+readme = "readme.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ESC-Guideline RAG contributors" }]
+keywords = ["rag", "cardiology", "heart-failure", "clinical-nlp", "esc-guidelines"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
